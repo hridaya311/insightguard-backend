@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import uuid
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
@@ -316,7 +317,9 @@ def insights(req: InsightsRequest) -> Dict[str, Any]:
     drivers_bits = []
     for d in top_pos[:3]:
         name = d.get(payload.get("category_col", "category"), d.get("category"))
-        drivers_bits.append(f"{name} (+{fmt_num(d.get('variance'))}, {fmt_pct(d.get('variance_pct'))})")
+        v = d.get("variance")
+        sign = "+" if (v is not None and v >= 0) else ""
+        drivers_bits.append(f"{name} ({sign}{fmt_num(v)}, {fmt_pct(d.get('variance_pct'))})")
 
     summary = "Budget vs Actual highlights: " + (", ".join(drivers_bits) if drivers_bits else "No major variances detected.") + "."
     if anoms:
@@ -685,53 +688,131 @@ class RunRequest(BaseModel):
     top_n: int = 5
     max_drivers: int = 5
 
+def _job_key(job_id: str) -> str:
+    return f"jobs/{job_id}.json"
+
+def _write_job(s3, bucket: str, job_id: str, job: dict) -> None:
+    s3.put_object(
+        Bucket=bucket,
+        Key=_job_key(job_id),
+        Body=json.dumps(job, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str) -> Dict[str, Any]:
+    try:
+        bucket = get_bucket()
+        s3 = get_s3()
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=_job_key(job_id))
+        return json.loads(obj["Body"].read().decode("utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Job not found: {e}")
+
 @app.post("/run")
 def run(req: RunRequest) -> Dict[str, Any]:
     """
     Orchestrates: extract -> features -> insights
-    Returns all S3 keys + executive summary.
+    Writes an auditable job record to S3 under jobs/<job_id>.json
+    Returns job_id + keys + executive summary.
     """
-    # 1) Extract (if needed)
-    extracted_key = req.extracted_s3_key
-    extract_resp = None
+    try:
+        bucket = get_bucket()
+        s3 = get_s3()
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    if not extracted_key:
-        if not req.s3_key:
-            raise HTTPException(status_code=400, detail="Provide either s3_key or extracted_s3_key")
-
-        extract_resp = extract(ExtractRequest(s3_key=req.s3_key, sheet_name=req.sheet_name))
-        extracted_key = extract_resp["extracted_s3_key"]
-
-    # 2) Features
-    feat_resp = features(FeaturesRequest(
-        extracted_s3_key=extracted_key,
-        category_col=req.category_col,
-        actual_col=req.actual_col,
-        baseline_col=req.baseline_col,
-        top_n=req.top_n
-    ))
-
-    # 3) Insights
-    ins_resp = insights(InsightsRequest(
-        features_s3_key=feat_resp["features_s3_key"],
-        max_drivers=req.max_drivers
-    ))
-
-    return {
+    job_id = uuid.uuid4().hex[:12]
+    job = {
+        "job_id": job_id,
+        "status": "started",
+        "created_at_utc": utc_ts(),
         "input": {
             "s3_key": req.s3_key,
-            "extracted_s3_key": extracted_key,
+            "extracted_s3_key": req.extracted_s3_key,
             "mapping": {
                 "category_col": req.category_col,
                 "actual_col": req.actual_col,
-                "baseline_col": req.baseline_col
-            }
+                "baseline_col": req.baseline_col,
+            },
+            "sheet_name": req.sheet_name,
+            "top_n": req.top_n,
+            "max_drivers": req.max_drivers,
         },
-        "outputs": {
-            "extracted_s3_key": extracted_key,
-            "features_s3_key": feat_resp["features_s3_key"],
-            "insights_s3_key": ins_resp["insights_s3_key"],
-            "executive_summary": ins_resp["executive_summary"]
-        },
-        "preview": (extract_resp["preview"] if extract_resp else None)
+        "outputs": {},
+        "errors": [],
+        "updated_at_utc": utc_ts(),
     }
+
+    _write_job(s3, bucket, job_id, job)
+
+    try:
+        # 1) Extract (if needed)
+        extracted_key = req.extracted_s3_key
+        extract_resp = None
+
+        if not extracted_key:
+            if not req.s3_key:
+                raise HTTPException(status_code=400, detail="Provide either s3_key or extracted_s3_key")
+
+            extract_resp = extract(ExtractRequest(s3_key=req.s3_key, sheet_name=req.sheet_name))
+            extracted_key = extract_resp["extracted_s3_key"]
+
+        job["outputs"]["extracted_s3_key"] = extracted_key
+        job["status"] = "extracted"
+        job["updated_at_utc"] = utc_ts()
+        _write_job(s3, bucket, job_id, job)
+
+        # 2) Features
+        feat_resp = features(FeaturesRequest(
+            extracted_s3_key=extracted_key,
+            category_col=req.category_col,
+            actual_col=req.actual_col,
+            baseline_col=req.baseline_col,
+            top_n=req.top_n
+        ))
+
+        job["outputs"]["features_s3_key"] = feat_resp["features_s3_key"]
+        job["status"] = "featured"
+        job["updated_at_utc"] = utc_ts()
+        _write_job(s3, bucket, job_id, job)
+
+        # 3) Insights
+        ins_resp = insights(InsightsRequest(
+            features_s3_key=feat_resp["features_s3_key"],
+            max_drivers=req.max_drivers
+        ))
+
+        job["outputs"]["insights_s3_key"] = ins_resp["insights_s3_key"]
+        job["outputs"]["executive_summary"] = ins_resp["executive_summary"]
+        if extract_resp:
+            job["outputs"]["preview"] = extract_resp.get("preview")
+
+        job["status"] = "completed"
+        job["updated_at_utc"] = utc_ts()
+        _write_job(s3, bucket, job_id, job)
+
+        return {
+            "job_id": job_id,
+            "job_s3_key": _job_key(job_id),
+            "input": job["input"],
+            "outputs": job["outputs"],
+        }
+
+    except HTTPException as e:
+        job["status"] = "failed"
+        job["errors"].append({"type": "http", "detail": str(e.detail)})
+        job["updated_at_utc"] = utc_ts()
+        _write_job(s3, bucket, job_id, job)
+        raise
+
+    except Exception as e:
+        job["status"] = "failed"
+        job["errors"].append({"type": "exception", "detail": str(e)})
+        job["updated_at_utc"] = utc_ts()
+        _write_job(s3, bucket, job_id, job)
+        raise HTTPException(status_code=500, detail=f"Run failed: {e}")
