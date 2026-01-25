@@ -3,3 +3,9 @@
 __pycache__/
 *.pyc
 .env.local
+
+# generated datasets
+data_out/
+*.jsonl
+*.jsonl.gz
+*.gz
