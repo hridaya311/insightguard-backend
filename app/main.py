@@ -858,17 +858,26 @@ def presign_upload(req: PresignUploadRequest) -> Dict[str, Any]:
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str) -> Dict[str, Any]:
+    """Fetch job record from S3 (robust)."""
+    s3 = get_s3()
+    bucket = get_bucket()
+    key = f"jobs/{job_id}.json"
     try:
-        bucket = get_bucket()
-        s3 = get_s3()
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    try:
-        obj = s3.get_object(Bucket=bucket, Key=_job_key(job_id))
-        return json.loads(obj["Body"].read().decode("utf-8"))
+        data = _s3_read_json(s3, bucket, key)
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"Job not found: {e}")
+
+    # Normalize: if stored as [ { ... } ] return the dict
+    if isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict):
+        data = data[0]
+
+    # If still list, wrap (so callers always get a dict-ish response)
+    if isinstance(data, list):
+        return {"job_id": job_id, "raw": data}
+
+    return data
+
+
 
 @app.post("/run")
 def run(req: RunRequest) -> Dict[str, Any]:
