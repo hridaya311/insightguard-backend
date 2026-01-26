@@ -823,6 +823,8 @@ class RunRequest(BaseModel):
     # Controls
     top_n: int = 5
     max_drivers: int = 5
+    verify: bool = False
+    fail_on_unverified: bool = False
 
 @app.post("/presign-upload")
 def presign_upload(req: PresignUploadRequest) -> Dict[str, Any]:
@@ -1065,3 +1067,35 @@ def run2(req: RunRequest) -> Dict[str, Any]:
         return _s3_read_json(s3, bucket, job_key)
     except Exception:
         return out
+
+
+from fastapi import Response
+
+
+from fastapi import Response
+
+@app.post("/run-verified")
+def run_verified(req: RunRequest, response: Response) -> Dict[str, Any]:
+    """
+    Enterprise-safe run:
+    - forces verification
+    - optionally fails closed (422) when verification fails
+    - returns the job json (including meta.verification)
+    """
+    # Build a new RunRequest-like dict so we don't mutate Pydantic object
+    payload = req.model_dump()
+    payload["verify"] = True  # force verification
+    # Ensure fail_on_unverified default is honored
+    payload["fail_on_unverified"] = bool(payload.get("fail_on_unverified", False))
+
+    # Call run2 using a proper model instance (safe)
+    req2 = RunRequest(**payload)
+    out = run2(req2)
+
+    ver = (out.get("meta") or {}).get("verification") if isinstance(out, dict) else None
+    if req2.fail_on_unverified:
+        if not (ver and ver.get("pass") is True):
+            response.status_code = 422
+            return {"detail": {"verification": ver or {"pass": False, "reasons": ["missing_verification"]},
+                               "job_id": out.get("job_id") if isinstance(out, dict) else None}}
+    return out
