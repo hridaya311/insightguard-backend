@@ -721,8 +721,7 @@ def presign_upload(req: PresignUploadRequest) -> Dict[str, Any]:
                 "Bucket": bucket,
                 "Key": key,
                 "ContentType": req.content_type,
-                "ServerSideEncryption": "AES256",
-            },
+                            },
             ExpiresIn=req.expires_in_seconds,
         )
     except Exception as e:
