@@ -691,12 +691,11 @@ class RunRequest(BaseModel):
 @app.post("/presign-upload")
 def presign_upload(req: PresignUploadRequest) -> Dict[str, Any]:
     """
-    Returns a SigV4 presigned PUT URL for direct-to-S3 uploads.
-    This avoids 413 limits on the API server and works for large files.
+    SigV4 presigned PUT URL for direct-to-S3 uploads.
+    Avoids API size limits (413) and works for large files.
     """
     bucket = get_bucket()
     s3 = get_s3()
-
     key = f"uploads/{utc_ts()}_{safe_name(req.filename)}"
 
     try:
