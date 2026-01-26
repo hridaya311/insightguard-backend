@@ -42,6 +42,22 @@ def utc_ts() -> str:
 def safe_name(name: str) -> str:
     return (name or "upload").replace("/", "_")
 
+def _job_key(job_id: str) -> str:
+    return f"jobs/{job_id}.json"
+
+def _write_job(s3, bucket: str, job_id: str, job: dict) -> None:
+    s3.put_object(
+        Bucket=bucket,
+        Key=_job_key(job_id),
+        Body=json.dumps(job).encode("utf-8"),
+        ContentType="application/json",
+        ServerSideEncryption="AES256",
+    )
+
+def _read_job(s3, bucket: str, job_id: str) -> dict:
+    obj = s3.get_object(Bucket=bucket, Key=_job_key(job_id))
+    return json.loads(obj["Body"].read().decode("utf-8"))
+
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     try:
