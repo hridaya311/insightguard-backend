@@ -1045,3 +1045,23 @@ def verify(req: VerifyRequest) -> Dict[str, Any]:
         forbid_new_categories=True,
         forbid_unsupported_numbers=True,
     )
+
+
+@app.post("/run2")
+def run2(req: RunRequest) -> Dict[str, Any]:
+    """
+    Safe wrapper: runs the pipeline and returns the stored job JSON from S3.
+    This ensures the response includes meta.verification (and any other job metadata).
+    """
+    out = run(req)  # existing endpoint returns {"job_id":..., ...} or job-like dict
+    job_id = out.get("job_id") if isinstance(out, dict) else None
+    if not job_id:
+        return out  # fallback
+
+    s3 = get_s3()
+    bucket = get_bucket()
+    job_key = f"jobs/{job_id}.json"
+    try:
+        return _s3_read_json(s3, bucket, job_key)
+    except Exception:
+        return out
