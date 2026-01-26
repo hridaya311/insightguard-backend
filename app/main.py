@@ -6,8 +6,10 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
 import boto3
+from botocore.config import Config
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from app.verifier import verify_insights_against_facts
 from pydantic import BaseModel
 
 app = FastAPI()
@@ -33,8 +35,7 @@ def get_region() -> str:
     return r
 
 def get_s3():
-    return boto3.client("s3", region_name=get_region())
-
+    return boto3.client("s3", region_name=get_region(), config=Config(signature_version="s3v4"))
 def utc_ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
@@ -266,6 +267,12 @@ class InsightsRequest(BaseModel):
     features_s3_key: str
     max_drivers: int = 5
 
+
+class VerifyRequest(BaseModel):
+    extracted_s3_key: str
+    features_s3_key: str
+    output_json: dict
+
 def fmt_pct(x: Optional[float]) -> Optional[str]:
     if x is None:
         return None
@@ -364,6 +371,38 @@ def insights(req: InsightsRequest) -> Dict[str, Any]:
             "engine": "template_v1"
         }
     }
+
+    # BRUTAL_ACCURACY_LOCKED: verify + fallback before persisting insights
+    table_cats = []
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=req.extracted_s3_key)
+        extracted_payload = json.loads(obj["Body"].read().decode("utf-8"))
+        rows = extracted_payload.get("rows") or extracted_payload.get("table") or extracted_payload.get("preview") or []
+        if isinstance(rows, list):
+            table_cats = sorted(set(str(r.get("category")) for r in rows if isinstance(r, dict) and r.get("category")))
+    except Exception:
+        table_cats = []
+
+    features_for_verify = locals().get("feats")
+    if not isinstance(features_for_verify, dict):
+        features_for_verify = {}
+
+    ver_report = verify_insights_against_facts(
+        out,
+        table_categories=table_cats,
+        features=features_for_verify,
+        require_json=True,
+        require_keys=True,
+        forbid_new_categories=True,
+        forbid_unsupported_numbers=True,
+    )
+    out.setdefault("meta", {})
+    if not ver_report.get("pass"):
+        out["executive_summary"] = "Variance commentary generated with guardrails. Review top movers and anomaly candidates for verified details."
+        out["meta"]["verification"] = ver_report
+    else:
+        out["meta"]["verification"] = {"pass": True}
+
 
     insights_key = f"insights/{utc_ts()}_{safe_name(os.path.basename(key))}.insights.json"
     try:
@@ -631,73 +670,57 @@ class PresignUploadRequest(BaseModel):
     content_type: str = "application/octet-stream"
     expires_in_seconds: int = 900  # 15 min
 
+
+class RunRequest(BaseModel):
+    # Either provide a raw uploaded file s3_key OR an extracted_s3_key
+    s3_key: str | None = None
+    extracted_s3_key: str | None = None
+
+    # Mapping for tabular variance-style data
+    category_col: str = "category"
+    actual_col: str = "actual"
+    baseline_col: str = "budget"  # budget/forecast/prior
+
+    # Optional for Excel
+    sheet_name: str | None = None
+
+    # Controls
+    top_n: int = 5
+    max_drivers: int = 5
+
 @app.post("/presign-upload")
 def presign_upload(req: PresignUploadRequest) -> Dict[str, Any]:
     """
-    Returns a pre-signed URL for uploading directly to S3 (PUT).
-    Client uploads file to S3 using the URL; then call /extract with returned s3_key.
+    Returns a SigV4 presigned PUT URL for direct-to-S3 uploads.
+    This avoids 413 limits on the API server and works for large files.
     """
-    try:
-        bucket = get_bucket()
-        s3 = get_s3()
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    bucket = get_bucket()
+    s3 = get_s3()
 
-    name = safe_name(req.filename)
-    if not name or name in ("upload", "file"):
-        raise HTTPException(status_code=400, detail="filename is required")
-
-    # Keep uploads organized + traceable
-    s3_key = f"uploads/{utc_ts()}_{name}"
+    key = f"uploads/{utc_ts()}_{safe_name(req.filename)}"
 
     try:
         url = s3.generate_presigned_url(
             ClientMethod="put_object",
             Params={
                 "Bucket": bucket,
-                "Key": s3_key,
+                "Key": key,
                 "ContentType": req.content_type,
+                "ServerSideEncryption": "AES256",
             },
-            ExpiresIn=int(req.expires_in_seconds),
+            ExpiresIn=req.expires_in_seconds,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate presigned URL: {e}")
 
     return {
         "s3_bucket": bucket,
-        "s3_key": s3_key,
+        "s3_key": key,
         "upload_method": "PUT",
         "upload_url": url,
-        "expires_in_seconds": int(req.expires_in_seconds),
-        "next_step": {"call_extract_with": {"s3_key": s3_key}},
+        "expires_in_seconds": req.expires_in_seconds,
+        "next_step": {"call_extract_with": {"s3_key": key}},
     }
-
-class RunRequest(BaseModel):
-    # Either provide s3_key (uploads/...) OR extracted_s3_key (extracted/...)
-    s3_key: Optional[str] = None
-    extracted_s3_key: Optional[str] = None
-
-    # Mapping (defaults match our sample files)
-    category_col: str = "category"
-    actual_col: str = "actual"
-    baseline_col: str = "budget"
-
-    # For xlsx
-    sheet_name: Optional[str] = None
-
-    top_n: int = 5
-    max_drivers: int = 5
-
-def _job_key(job_id: str) -> str:
-    return f"jobs/{job_id}.json"
-
-def _write_job(s3, bucket: str, job_id: str, job: dict) -> None:
-    s3.put_object(
-        Bucket=bucket,
-        Key=_job_key(job_id),
-        Body=json.dumps(job, indent=2).encode("utf-8"),
-        ContentType="application/json",
-    )
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str) -> Dict[str, Any]:
@@ -816,3 +839,35 @@ def run(req: RunRequest) -> Dict[str, Any]:
         job["updated_at_utc"] = utc_ts()
         _write_job(s3, bucket, job_id, job)
         raise HTTPException(status_code=500, detail=f"Run failed: {e}")
+
+@app.post("/verify")
+def verify(req: VerifyRequest) -> Dict[str, Any]:
+    bucket = get_bucket()
+    s3 = get_s3()
+
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=req.extracted_s3_key)
+        extracted = json.loads(obj["Body"].read().decode("utf-8"))
+        rows = extracted.get("rows") or extracted.get("table") or extracted.get("preview") or []
+        cats = sorted(set(str(r.get("category")) for r in rows if isinstance(r, dict) and r.get("category")))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to load extracted: {e}")
+
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=req.features_s3_key)
+        features_payload = json.loads(obj["Body"].read().decode("utf-8"))
+        feats = features_payload.get("features") if isinstance(features_payload.get("features"), dict) else features_payload
+        if not isinstance(feats, dict):
+            feats = {}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to load features: {e}")
+
+    return verify_insights_against_facts(
+        req.output_json,
+        table_categories=cats,
+        features=feats,
+        require_json=True,
+        require_keys=True,
+        forbid_new_categories=True,
+        forbid_unsupported_numbers=True,
+    )
