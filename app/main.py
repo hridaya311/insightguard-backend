@@ -1,4 +1,5 @@
 import os
+from botocore.exceptions import ClientError
 import io
 import json
 import uuid
@@ -57,6 +58,125 @@ def _write_job(s3, bucket: str, job_id: str, job: dict) -> None:
 def _read_job(s3, bucket: str, job_id: str) -> dict:
     obj = s3.get_object(Bucket=bucket, Key=_job_key(job_id))
     return json.loads(obj["Body"].read().decode("utf-8"))
+
+
+def _s3_read_json(s3, bucket: str, key: str):
+    """
+    Read JSON from S3 and normalize common shapes.
+    Some earlier extract steps may store a list instead of an envelope dict.
+    Returns dict or list depending on content, but attempts to wrap lists into a dict when it looks like tabular data.
+    """
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    data = json.loads(obj["Body"].read().decode("utf-8"))
+
+    # Normalize: if data is a list, try to wrap/unwrap to expected dict shapes
+    if isinstance(data, list):
+        # Case A: list with a single dict envelope
+        if len(data) == 1 and isinstance(data[0], dict):
+            return data[0]
+        # Case B: list of dict rows (tabular)
+        if len(data) > 0 and all(isinstance(x, dict) for x in data[:5]):
+            return {"preview": data}
+        # Otherwise return as-is
+        return data
+
+    return data
+
+
+def _s3_exists(s3, bucket: str, key: str) -> bool:
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError:
+        return False
+
+def verify_insights_v1(*, extracted: dict, features: dict, insights: dict) -> dict:
+    """
+    Deterministic verification gate (bulletproof):
+    - Never throws.
+    - Validates types first.
+    - Checks required keys in insights (if dict).
+    - Checks driver categories exist in extracted categories (best effort).
+    - Soft check: exec summary mentions at least one mover.
+    """
+    # ---- type guards ----
+    if not isinstance(extracted, dict):
+        return {"pass": False, "reasons": [f"bad_type:extracted:{type(extracted).__name__}"]}
+    if not isinstance(features, dict):
+        return {"pass": False, "reasons": [f"bad_type:features:{type(features).__name__}"]}
+    if not isinstance(insights, dict):
+        return {"pass": False, "reasons": [f"bad_type:insights:{type(insights).__name__}"]}
+
+    reasons = []
+    passed = True
+
+    # required keys
+    for k in ["executive_summary", "key_drivers", "risks", "recommendations"]:
+        if k not in insights:
+            passed = False
+            reasons.append(f"missing_key:{k}")
+
+    # extracted categories from preview (best effort)
+    cats = set()
+    preview = extracted.get("preview") or []
+    if isinstance(preview, list):
+        for row in preview:
+            if isinstance(row, dict) and "category" in row:
+                cats.add(str(row["category"]))
+
+    # movers
+    movers = []
+    tm = features.get("top_movers") or []
+    if isinstance(tm, list):
+        for item in tm[:5]:
+            if isinstance(item, dict) and item.get("category") is not None:
+                movers.append(str(item.get("category")))
+
+    # parse key_drivers into categories (supports list[str] OR list[dict])
+    kd = insights.get("key_drivers") or []
+    kd_cats = []
+    if isinstance(kd, list):
+        for item in kd[:10]:
+            if isinstance(item, dict) and item.get("category") is not None:
+                kd_cats.append(str(item.get("category")))
+            elif isinstance(item, str):
+                s = item.strip().lstrip("-").strip()
+                # common: "Sales: ..." -> "Sales"
+                cat = s.split(":")[0].strip()
+                if cat:
+                    kd_cats.append(cat)
+
+    # hard check (only if we have extracted cats)
+    if cats and kd_cats:
+        bad = [c for c in kd_cats if c not in cats]
+        if bad:
+            passed = False
+            reasons.append("key_driver_category_not_in_extracted:" + ",".join(bad[:5]))
+
+    # soft check: exec summary mentions at least one mover (optional)
+    exec_sum = insights.get("executive_summary")
+    exec_sum = str(exec_sum) if exec_sum is not None else ""
+    if movers and exec_sum and not any(c in exec_sum for c in movers[:3]):
+        reasons.append("exec_summary_missing_top_mover_names")
+
+    return {"pass": passed, "reasons": reasons}
+
+
+def presign_download(key: str, expires_in_seconds: int = 900) -> dict:
+    """
+    Presigned GET for any object in this bucket (restricted by IAM policy).
+    Use this for UI downloads without proxying through the API.
+    """
+    bucket = get_bucket()
+    s3 = get_s3()
+    if not _s3_exists(s3, bucket, key):
+        raise HTTPException(status_code=404, detail=f"No such key: {key}")
+    url = s3.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=expires_in_seconds,
+    )
+    return {"s3_bucket": bucket, "s3_key": key, "download_url": url, "expires_in_seconds": expires_in_seconds}
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -832,6 +952,37 @@ def run(req: RunRequest) -> Dict[str, Any]:
         job["status"] = "completed"
         job["updated_at_utc"] = utc_ts()
         _write_job(s3, bucket, job_id, job)
+
+
+        # ---- verification gate ----
+
+        if getattr(req, "verify", True):
+
+            try:
+
+                extracted_obj = _s3_read_json(s3, bucket, job["outputs"]["extracted_s3_key"])
+
+                features_obj  = _s3_read_json(s3, bucket, job["outputs"]["features_s3_key"])
+
+                insights_obj  = _s3_read_json(s3, bucket, job["outputs"]["insights_s3_key"])
+
+                verification = verify_insights_v1(extracted=extracted_obj, features=features_obj, insights=insights_obj)
+
+            except Exception as e:
+
+                verification = {"pass": False, "reasons": [f"verification_exception:{e.__class__.__name__}"]}
+
+
+            job.setdefault("meta", {})
+
+            job["meta"]["verification"] = verification
+
+            _write_job(s3, bucket, job_id, job)
+
+
+            if getattr(req, "fail_on_unverified", True) and not verification.get("pass", False):
+
+                raise HTTPException(status_code=422, detail={"verification": verification, "job_id": job_id})
 
         return {
             "job_id": job_id,
