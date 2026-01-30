@@ -18,7 +18,7 @@ FIXTURES = [
         }
     },
     {
-        "name": "FAIL - unreconciled deltas (revenue move not explained)",
+        "name": "FAIL - unreconciled deltas (revenue move not explained) [PRIMARY]",
         "expect_status": 422,
         "payload": {
             "tenant_id": "demo-tenant",
@@ -26,12 +26,12 @@ FIXTURES = [
             "projection": {"period": "Q2-2026", "metrics": {"revenue": 120000000, "gross_margin": 0.62, "operating_margin": 0.28}},
             "assumptions": {
                 "cost_structure": "mixed",
-                "narrative": "We expect continued execution with stable costs and operational focus."
+                "narrative": "Operating margin remains flat due to incremental investments that offset operating leverage. Execution remains strong."
             }
         }
     },
     {
-        "name": "FAIL - narrative numeric misalignment (claims margin expansion, OM down)",
+        "name": "FAIL - narrative numeric misalignment (claims margin expansion, OM down) [PRIMARY]",
         "expect_status": 422,
         "payload": {
             "tenant_id": "demo-tenant",
@@ -39,12 +39,12 @@ FIXTURES = [
             "projection": {"period": "Q2-2026", "metrics": {"revenue": 130000000, "gross_margin": 0.62, "operating_margin": 0.29}},
             "assumptions": {
                 "cost_structure": "mixed",
-                "narrative": "We expect margin expansion driven by operating leverage and cost discipline."
+                "narrative": "Revenue increases due to volume growth. We expect margin expansion driven by operating leverage and cost discipline."
             }
         }
     },
     {
-        "name": "FAIL - baseline constraint violation (OM up while GM flat/down, no opex lever)",
+        "name": "FAIL - baseline constraint violation (OM up while GM flat/down, no opex lever) [PRIMARY]",
         "expect_status": 422,
         "payload": {
             "tenant_id": "demo-tenant",
@@ -52,7 +52,7 @@ FIXTURES = [
             "projection": {"period": "Q2-2026", "metrics": {"revenue": 120000000, "gross_margin": 0.61, "operating_margin": 0.29}},
             "assumptions": {
                 "cost_structure": "mixed",
-                "narrative": "We expect improved profitability driven by execution and focus."
+                "narrative": "Gross margin declines due to pricing and mix. Operating margin improves due to one-time benefits and investment timing."
             }
         }
     },
