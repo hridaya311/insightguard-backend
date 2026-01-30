@@ -9,3 +9,4 @@ data_out/
 *.jsonl
 *.jsonl.gz
 *.gz
+.venv/
