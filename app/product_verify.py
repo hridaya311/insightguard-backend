@@ -159,6 +159,23 @@ def run_product_verification(req: RunVerifiedRequest) -> VerificationResult:
         ))
 
     # -------------------------
+    # Check #4: Baseline Constraint Violations (v1 deterministic)
+    # Certain combinations require an explicit lever explanation.
+    # -------------------------
+    CONSTRAINT_MARGIN_MATERIAL = 0.005  # 50 bps
+
+    opex_terms = ["opex", "operating expense", "operating expenses", "sg&a", "headcount", "efficiency", "cost discipline", "expense discipline", "cost reduction"]
+
+    # Constraint A:
+    # If OM improves materially but GM is flat/down, narrative must explicitly cite opex/efficiency/expense levers.
+    if om_delta >= CONSTRAINT_MARGIN_MATERIAL and gm_delta <= 0:
+        if not any(t in narrative for t in opex_terms):
+            failures.append(Failure(
+                code="BASELINE_CONSTRAINT_VIOLATION",
+                message="Operating margin improves materially while gross margin is flat/down; this requires an explicit opex/efficiency explanation in the assumptions narrative."
+            ))
+
+    # -------------------------
     # Check #1: Logical inconsistency between assumptions and outcomes (existing v1 rule)
     # -------------------------
     MATERIAL_REV_GROWTH = 0.10  # 10%
