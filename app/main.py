@@ -10,6 +10,7 @@ import boto3
 from botocore.config import Config
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
 from app.verifier import verify_insights_against_facts
 from pydantic import BaseModel
 
@@ -1099,3 +1100,109 @@ def run_verified(req: RunRequest, response: Response) -> Dict[str, Any]:
             return {"detail": {"verification": ver or {"pass": False, "reasons": ["missing_verification"]},
                                "job_id": out.get("job_id") if isinstance(out, dict) else None}}
     return out
+
+# =========================
+# Product v1 (Locked) API
+# =========================
+
+from app.product_contracts import RunVerifiedRequest, RunVerifiedResponse, Failure
+from app.product_verify import run_product_verification
+from app.product_report import build_verification_report
+from app.product_storage import tenant_job_key, tenant_report_key, s3_put_json, s3_get_json
+
+class _RunV1Out(BaseModel):
+    # kept for compatibility if you want to inspect response shapes easily in docs
+    pass
+
+@app.post("/run-verified-v1", response_model=RunVerifiedResponse)
+def run_verified_v1(req: RunVerifiedRequest):
+    """
+    Locked v1 product path:
+    - input = baseline + projection + assumptions narrative
+    - output = PASS/FAIL + reasons + report artifact
+    - fail-closed
+    """
+    bucket = get_bucket()
+    s3 = get_s3()
+
+    job_id = str(uuid.uuid4())
+    run_id = str(uuid.uuid4())
+    ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    result = run_product_verification(req)
+
+    verification_meta = {
+        "pass": (result.verdict == "PASS"),
+        "fail_count": len(result.failures),
+        "timestamp": ts,
+        "run_id": run_id,
+    }
+    response_meta = {
+        "verification": verification_meta,
+        "tenant_id": req.tenant_id,
+        "job_id": job_id,
+    }
+
+    # Build report JSON artifact (core product artifact)
+    report_obj = build_verification_report(
+        verification_id=f"IG-{run_id}",
+        timestamp=ts,
+        artifact_label=f"{req.projection.period} projection vs {req.baseline.period} baseline",
+        verdict=result.verdict,
+        failures=[f.model_dump() for f in result.failures],
+        verified_scope=result.verified_scope,
+        reasoning_trace=result.reasoning_trace,
+    )
+
+    report_key = tenant_report_key(req.tenant_id, run_id)
+    s3_put_json(s3, bucket, report_key, report_obj)
+
+    # Persist job record (tenant-isolated)
+    job = {
+        "job_id": job_id,
+        "run_id": run_id,
+        "tenant_id": req.tenant_id,
+        "timestamp": ts,
+        "verdict": result.verdict,
+        "meta": response_meta,
+        "failures": [f.model_dump() for f in result.failures],
+        "report": {"format": "signoff", "location": report_key},
+    }
+    s3_put_json(s3, bucket, tenant_job_key(req.tenant_id, job_id), job)
+
+    # Fail-closed: non-200 on FAIL
+    if result.verdict == "FAIL":
+        return JSONResponse(
+            status_code=422,
+            content={
+                "verdict": "FAIL",
+                "meta": response_meta,
+                "failures": [f.model_dump() for f in result.failures],
+                "instruction": "External approval should not proceed until issues are resolved or explicitly justified.",
+                "report": {"format": "signoff", "location": report_key},
+            },
+        )
+
+
+
+    return RunVerifiedResponse(
+        verdict="PASS",
+        meta=response_meta,
+        failures=[],
+        instruction=None,
+        report={"format": "signoff", "location": report_key},
+    )
+
+
+@app.get("/jobs-v1/{tenant_id}/{job_id}")
+def get_job_v1(tenant_id: str, job_id: str):
+    """
+    Tenant-isolated job retrieval for product v1.
+    """
+    bucket = get_bucket()
+    s3 = get_s3()
+    key = tenant_job_key(tenant_id, job_id)
+    try:
+        return s3_get_json(s3, bucket, key)
+    except ClientError:
+        raise HTTPException(status_code=404, detail={"error": "job_not_found", "job_id": job_id})
