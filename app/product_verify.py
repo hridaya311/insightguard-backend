@@ -119,6 +119,46 @@ def run_product_verification(req: RunVerifiedRequest) -> VerificationResult:
             ))
 
     # -------------------------
+    # Check #3: Narrative–Numeric Misalignment (v1 deterministic)
+    # If narrative claims a directional change that contradicts the deltas, FAIL.
+    # -------------------------
+    # materiality for narrative claims (slightly tighter than check #2 to avoid noise)
+    CLAIM_MARGIN_MATERIAL = 0.003  # 30 bps
+
+    claims_margin_up = ["margin expansion", "margins improved", "improved profitability", "profitability improved", "operating leverage", "opex discipline", "cost discipline"]
+    claims_margin_down = ["margin pressure", "margin compression", "profitability declined", "cost headwinds"]
+    claims_gm_up = ["gross margin improved", "gross margin expansion", "cogs improved", "better unit economics", "pricing improved", "mix improved"]
+    claims_gm_down = ["gross margin pressure", "gross margin compression", "pricing pressure", "mix worsened", "cogs increased"]
+
+    # If they claim margins up but OM is down materially
+    if any(t in narrative for t in claims_margin_up) and om_delta <= -CLAIM_MARGIN_MATERIAL:
+        failures.append(Failure(
+            code="NARRATIVE_NUMERIC_MISALIGNMENT",
+            message="Assumptions narrative implies operating margin improvement, but operating margin declines materially versus baseline."
+        ))
+
+    # If they claim margin pressure but OM is up materially
+    if any(t in narrative for t in claims_margin_down) and om_delta >= CLAIM_MARGIN_MATERIAL:
+        failures.append(Failure(
+            code="NARRATIVE_NUMERIC_MISALIGNMENT",
+            message="Assumptions narrative implies operating margin pressure, but operating margin improves materially versus baseline."
+        ))
+
+    # If they claim gross margin up but GM is down materially
+    if any(t in narrative for t in claims_gm_up) and gm_delta <= -CLAIM_MARGIN_MATERIAL:
+        failures.append(Failure(
+            code="NARRATIVE_NUMERIC_MISALIGNMENT",
+            message="Assumptions narrative implies gross margin improvement, but gross margin declines materially versus baseline."
+        ))
+
+    # If they claim gross margin pressure but GM is up materially
+    if any(t in narrative for t in claims_gm_down) and gm_delta >= CLAIM_MARGIN_MATERIAL:
+        failures.append(Failure(
+            code="NARRATIVE_NUMERIC_MISALIGNMENT",
+            message="Assumptions narrative implies gross margin pressure, but gross margin improves materially versus baseline."
+        ))
+
+    # -------------------------
     # Check #1: Logical inconsistency between assumptions and outcomes (existing v1 rule)
     # -------------------------
     MATERIAL_REV_GROWTH = 0.10  # 10%
